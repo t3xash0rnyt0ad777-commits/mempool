@@ -24,6 +24,7 @@ const MAX_STANDARD_SCRIPTSIG_SIZE = 1650;
 const DUST_RELAY_TX_FEE = 3;
 const MAX_OP_RETURN_RELAY = 83;
 const DEFAULT_PERMIT_BAREMULTISIG = true;
+const MAX_TX_LEGACY_SIGOPS = 2_500 * 4; // witness-adjusted sigops
 
 export class Common {
   static nativeAssetId = config.MEMPOOL.NETWORK === 'liquidtestnet' ?
@@ -224,6 +225,11 @@ export class Common {
       return true;
     }
 
+    // legacy sigops
+    if (this.isNonStandardLegacySigops(tx, height)) {
+      return true;
+    }
+
     // input validation
     for (const vin of tx.vin) {
       if (vin.is_coinbase) {
@@ -235,7 +241,7 @@ export class Common {
         return true;
       }
       // scriptsig-not-pushonly
-      if (vin.scriptsig_asm) {
+      if (vin.scriptsig_asm?.length) {
         for (const op of vin.scriptsig_asm.split(' ')) {
           if (opcodes[op] && opcodes[op] > opcodes['OP_16']) {
             return true;
@@ -285,6 +291,7 @@ export class Common {
 
     // output validation
     let opreturnCount = 0;
+    let opreturnBytes = 0;
     for (const vout of tx.vout) {
       // scriptpubkey
       if (['nonstandard', 'provably_unspendable', 'empty'].includes(vout.scriptpubkey_type)) {
@@ -308,10 +315,7 @@ export class Common {
         }
       } else if (vout.scriptpubkey_type === 'op_return') {
         opreturnCount++;
-        if ((vout.scriptpubkey.length / 2) > MAX_OP_RETURN_RELAY) {
-          // over default datacarrier limit
-          return true;
-        }
+        opreturnBytes += vout.scriptpubkey.length / 2;
       }
       // dust
       // (we could probably hardcode this for the different output types...)
@@ -333,9 +337,11 @@ export class Common {
       }
     }
 
-    // multi-op-return
-    if (opreturnCount > 1) {
-      return true;
+    // op_return
+    if (opreturnCount > 0) {
+      if (!this.isStandardOpReturn(opreturnBytes, opreturnCount, height)) {
+        return true;
+      }
     }
 
     // TODO: non-mandatory-script-verify-flag
@@ -428,6 +434,49 @@ export class Common {
     return false;
   }
 
+  // OP_RETURN size & count limits were lifted in v28.3/v29.2/v30.0
+  static OP_RETURN_STANDARDNESS_ACTIVATION_HEIGHT = {
+    'testnet4': 108_000,
+    'testnet': 4_750_000,
+    'signet': 276_500,
+    '': 921_000,
+  };
+  static MAX_DATACARRIER_BYTES = 83;
+  static isStandardOpReturn(bytes: number, outputs: number,height?: number): boolean {
+    if (
+      (height == null || (
+        this.OP_RETURN_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+        && height >= this.OP_RETURN_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      )) // limits lifted
+      || // OR
+      (bytes <= this.MAX_DATACARRIER_BYTES && outputs <= 1) // below old limits
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // New legacy sigops limit started to be enforced in v30.0
+  static LEGACY_SIGOPS_STANDARDNESS_ACTIVATION_HEIGHT = {
+    'testnet4': 108_000,
+    'testnet': 4_750_000,
+    'signet': 276_500,
+    '': 921_000,
+  };
+  static isNonStandardLegacySigops(tx: TransactionExtended, height?: number): boolean {
+    if (
+      height == null || (
+        this.LEGACY_SIGOPS_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+        && height >= this.LEGACY_SIGOPS_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      )
+    ) {
+      if (!transactionUtils.checkSigopsBIP54(tx, MAX_TX_LEGACY_SIGOPS)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static getNonWitnessSize(tx: TransactionExtended): number {
     let weight = tx.weight;
     let hasWitness = false;
@@ -459,7 +508,7 @@ export class Common {
   }
 
   static setLegacySighashFlags(flags: bigint, scriptsig_asm: string): bigint {
-    for (const item of scriptsig_asm.split(' ')) {
+    for (const item of scriptsig_asm?.split(' ') ?? []) {
       // skip op_codes
       if (item.startsWith('OP_')) {
         continue;
@@ -884,6 +933,13 @@ export class Common {
   }
 
   static findSocketNetwork(addr: string): {network: string | null, url: string} {
+    if (!addr?.length) {
+      return {
+        network: null,
+        url: ''
+      };
+    }
+
     let network: string | null = null;
     let url: string = addr;
 
@@ -891,7 +947,7 @@ export class Common {
       url = addr.split('://')[1];
     }
 
-    if (!url) {
+    if (!url?.length) {
       return {
         network: null,
         url: addr,
@@ -917,7 +973,15 @@ export class Common {
         };
       }
     } else if (addr.indexOf('ipv6') !== -1 || (config.LIGHTNING.BACKEND === 'lnd' && url.indexOf(']:'))) {
-      url = url.split('[')[1].split(']')[0];
+      const parts = url.split('[');
+      if (parts.length < 2) {
+        return {
+          network: null,
+          url: addr,
+        };
+      } else {
+        url = parts[1].split(']')[0];
+      }
       const ipv = isIP(url);
       if (ipv === 6) {
         const parts = addr.split(':');
